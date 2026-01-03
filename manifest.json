@@ -1,0 +1,11 @@
+{
+  "id": "atlas-weather",
+  "name": "Weather",
+  "version": "1.0.0",
+  "description": "Weather forecasts for your saved locations",
+  "author": "Atlas",
+  "authorUrl": "https://github.com/atlas-app",
+  "minAtlasVersion": "1.0.0",
+  "permissions": ["network", "storage", "core:locations"],
+  "main": "main.js"
+}
