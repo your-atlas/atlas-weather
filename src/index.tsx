@@ -30,6 +30,7 @@ interface PluginAPI {
     registerRoute: (route: any) => void
     registerSidebarItem: (item: any) => void
     registerWidget: (widget: any) => void
+    registerSettingsPanel: (panel: any) => void
     showToast: (message: string, type?: string) => void
   }
 }
@@ -42,6 +43,7 @@ interface SharedDependencies {
   CardHeader: any
   CardTitle: any
   Input: any
+  Label: any
   Select: any
   SelectContent: any
   SelectItem: any
@@ -67,8 +69,8 @@ let api: PluginAPI
  * Weather Page Component
  */
 function WeatherPage() {
-  const { React, Card, CardContent, CardHeader, Skeleton, useAppData, lucideIcons, useSecondarySidebar } = shared
-  const { useState, useEffect, useMemo } = React
+  const { React, Card, CardContent, CardHeader, useAppData, lucideIcons, useSecondarySidebar } = shared
+  const { useEffect, useMemo } = React
   
   const { 
     weather, 
@@ -114,12 +116,8 @@ function WeatherPage() {
     }
   }, [weatherLocationId, currentLocation, homeLocation?.id])
 
-  const handleLocationChange = (locationId: string) => {
-    setWeatherLocationId(locationId)
-  }
-
   // Icons
-  const { Home, Navigation, Cloud, CloudRain, Sun, CloudSun, Wind, Droplets, Sunrise, Sunset } = lucideIcons
+  const { Home, Navigation, Cloud, CloudRain, Sun, CloudSun } = lucideIcons
 
   // Get weather icon
   const getWeatherIcon = (icon: string) => {
@@ -411,6 +409,80 @@ function WeatherPage() {
 }
 
 /**
+ * Weather Settings Panel Component
+ */
+function WeatherSettings() {
+  const { React, Label, Select, SelectContent, SelectItem, SelectTrigger, SelectValue } = shared
+  const { useState, useEffect } = React
+
+  const [refreshInterval, setRefreshInterval] = useState(30)
+  const [temperatureUnit, setTemperatureUnit] = useState<'fahrenheit' | 'celsius'>('fahrenheit')
+  const [loading, setLoading] = useState(true)
+
+  // Load settings on mount
+  useEffect(() => {
+    async function loadSettings() {
+      const interval = await api.storage.get<number>('refreshInterval')
+      const unit = await api.storage.get<'fahrenheit' | 'celsius'>('temperatureUnit')
+      
+      if (interval) setRefreshInterval(interval)
+      if (unit) setTemperatureUnit(unit)
+      setLoading(false)
+    }
+    loadSettings()
+  }, [])
+
+  // Save helper
+  const updateSetting = async <T,>(key: string, value: T, setter: (v: T) => void) => {
+    setter(value)
+    await api.storage.set(key, value)
+  }
+
+  if (loading) {
+    return <div className="text-sm text-muted-foreground">Loading settings...</div>
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Refresh Interval */}
+      <div className="flex items-center justify-between">
+        <Label className="text-sm">Refresh interval</Label>
+        <Select
+          value={String(refreshInterval)}
+          onValueChange={(v: string) => updateSetting('refreshInterval', Number(v), setRefreshInterval)}
+        >
+          <SelectTrigger className="w-32">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="15">15 minutes</SelectItem>
+            <SelectItem value="30">30 minutes</SelectItem>
+            <SelectItem value="60">1 hour</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+
+      {/* Temperature Unit */}
+      <div className="flex items-center justify-between">
+        <Label className="text-sm">Temperature unit</Label>
+        <Select
+          value={temperatureUnit}
+          onValueChange={(v: string) => updateSetting('temperatureUnit', v as 'fahrenheit' | 'celsius', setTemperatureUnit)}
+        >
+          <SelectTrigger className="w-32">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="fahrenheit">Fahrenheit</SelectItem>
+            <SelectItem value="celsius">Celsius</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+    </div>
+  )
+}
+
+/**
  * Plugin activation
  */
 export function activate(pluginApi: PluginAPI, sharedDeps: SharedDependencies) {
@@ -432,6 +504,12 @@ export function activate(pluginApi: PluginAPI, sharedDeps: SharedDependencies) {
   api.ui.registerRoute({
     path: '/weather',
     component: WeatherPage,
+  })
+
+  api.ui.registerSettingsPanel({
+    id: 'weather-settings',
+    component: WeatherSettings,
+    order: 10,
   })
 
   console.log(`[${api.pluginId}] Weather plugin activated`)
