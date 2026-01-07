@@ -1,7 +1,7 @@
 {
   "id": "atlas-weather",
   "name": "Weather",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Weather forecasts for your location and saved locations",
   "author": "Ryan-Milton",
   "authorUrl": "https://github.com/Ryan-Milton",
