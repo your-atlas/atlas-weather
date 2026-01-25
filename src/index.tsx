@@ -65,67 +65,260 @@ interface SharedDependencies {
 let shared: SharedDependencies
 let api: PluginAPI
 
+// ============ WEATHER ICON UTILITIES ============
+// Static map for weather icon lookup - avoids recreation on every render
+const WEATHER_ICON_MAP: Record<string, string> = {
+  '01': 'Sun',
+  '02': 'CloudSun',
+  '03': 'Cloud',
+  '04': 'Cloud',
+  '09': 'CloudRain',
+  '10': 'CloudRain',
+  '11': 'CloudRain',
+  '13': 'Cloud',
+  '50': 'Cloud',
+}
+
+function getWeatherIconKey(iconCode: string | undefined): string {
+  if (!iconCode) return 'Cloud'
+  const prefix = iconCode.substring(0, 2)
+  return WEATHER_ICON_MAP[prefix] || 'Cloud'
+}
+
+// ============ WEATHER CACHE UTILITIES ============
+interface CachedWeatherData {
+  data: any
+  timestamp: number
+  locationId: string
+}
+
+interface WeatherCache {
+  [locationId: string]: CachedWeatherData
+}
+
+// Module-level cache (survives component remounts within session)
+let weatherCache: WeatherCache = {}
+const CACHE_TTL_MS = 5 * 60 * 1000 // 5 minutes
+
+function getCachedWeather(locationId: string): CachedWeatherData | null {
+  const cached = weatherCache[locationId]
+  if (!cached) return null
+
+  const isExpired = Date.now() - cached.timestamp > CACHE_TTL_MS
+  if (isExpired) {
+    delete weatherCache[locationId]
+    return null
+  }
+
+  return cached
+}
+
+function setCachedWeather(locationId: string, data: any): void {
+  weatherCache[locationId] = {
+    data,
+    timestamp: Date.now(),
+    locationId,
+  }
+}
+
+function isCacheStale(locationId: string): boolean {
+  const cached = weatherCache[locationId]
+  if (!cached) return true
+  return Date.now() - cached.timestamp > CACHE_TTL_MS
+}
+
+// ============ RATE LIMITING UTILITIES ============
+// Debounce utility for preventing rapid API calls
+function debounce<T extends (...args: any[]) => any>(
+  func: T,
+  wait: number
+): (...args: Parameters<T>) => void {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null
+
+  return (...args: Parameters<T>) => {
+    if (timeoutId) {
+      clearTimeout(timeoutId)
+    }
+    timeoutId = setTimeout(() => {
+      func(...args)
+      timeoutId = null
+    }, wait)
+  }
+}
+
+// Throttle tracking for manual refreshes
+let lastRefreshTimestamp: Record<string, number> = {}
+const REFRESH_COOLDOWN_MS = 30 * 1000 // 30 seconds
+
+function canRefresh(locationId: string): boolean {
+  const lastRefresh = lastRefreshTimestamp[locationId]
+  if (!lastRefresh) return true
+  return Date.now() - lastRefresh > REFRESH_COOLDOWN_MS
+}
+
+function recordRefresh(locationId: string): void {
+  lastRefreshTimestamp[locationId] = Date.now()
+}
+
+function getRefreshCooldownRemaining(locationId: string): number {
+  const lastRefresh = lastRefreshTimestamp[locationId]
+  if (!lastRefresh) return 0
+  const elapsed = Date.now() - lastRefresh
+  return Math.max(0, REFRESH_COOLDOWN_MS - elapsed)
+}
+
+// ============ STORAGE KEYS ============
+const LAST_LOCATION_KEY = 'lastViewedWeatherLocation'
+
 /**
  * Weather Page Component
  */
 function WeatherPage() {
   const { React, Card, CardContent, CardHeader, useAppData, lucideIcons, useSecondarySidebar } = shared
-  const { useEffect, useMemo } = React
-  
-  const { 
-    weather, 
-    weatherLoading, 
-    weatherError, 
-    homeLocation, 
-    savedLocations, 
-    refreshWeather, 
-    currentLocation 
+  const { useEffect, useMemo, useState, useCallback, useRef } = React
+
+  const {
+    weather,
+    weatherLoading,
+    weatherError,
+    homeLocation,
+    savedLocations,
+    refreshWeather,
+    currentLocation
   } = useAppData()
-  
+
+  // State for stale-while-revalidate pattern
+  const [cachedWeatherDisplay, setCachedWeatherDisplay] = useState<any>(null)
+  const [isRevalidating, setIsRevalidating] = useState(false)
+
+  // Ref to track debounced refresh
+  const debouncedRefreshRef = useRef<ReturnType<typeof debounce> | null>(null)
+
   // Try to use secondary sidebar if available
   let weatherLocationId = ''
   let setWeatherLocationId = (_id: string) => {}
-  
+
   if (useSecondarySidebar) {
     const sidebarContext = useSecondarySidebar()
     weatherLocationId = sidebarContext.weatherLocationId || ''
     setWeatherLocationId = sidebarContext.setWeatherLocationId || (() => {})
   }
 
-  // Set initial selected location
+  // Create debounced refresh function (300ms debounce)
+  const debouncedRefresh = useCallback((locationId: string) => {
+    if (!debouncedRefreshRef.current) {
+      debouncedRefreshRef.current = debounce((locId: string) => {
+        // Check throttle before making API call
+        if (canRefresh(locId)) {
+          recordRefresh(locId)
+          setIsRevalidating(true)
+          refreshWeather(locId)
+        }
+      }, 300)
+    }
+    debouncedRefreshRef.current(locationId)
+  }, [refreshWeather])
+
+  // Set initial selected location - with last location memory
   useEffect(() => {
-    if (!weatherLocationId) {
-      if (currentLocation) {
-        setWeatherLocationId('current-location')
-      } else if (homeLocation) {
-        setWeatherLocationId(homeLocation.id)
+    async function initializeLocation() {
+      if (!weatherLocationId) {
+        // Try to restore last viewed location
+        const lastLocation = await api.storage.get<string>(LAST_LOCATION_KEY)
+
+        if (lastLocation) {
+          // Verify the location still exists
+          const isValidSaved = savedLocations.some((loc: any) => loc.id === lastLocation)
+          const isCurrentLocation = lastLocation === 'current-location' && currentLocation
+          const isHome = lastLocation === homeLocation?.id
+
+          if (isValidSaved || isCurrentLocation || isHome) {
+            setWeatherLocationId(lastLocation)
+            return
+          }
+        }
+
+        // Fallback to defaults
+        if (currentLocation) {
+          setWeatherLocationId('current-location')
+        } else if (homeLocation) {
+          setWeatherLocationId(homeLocation.id)
+        }
       }
     }
-  }, [currentLocation, homeLocation, weatherLocationId])
+    initializeLocation()
+  }, [currentLocation, homeLocation, weatherLocationId, savedLocations])
 
-  // Refresh weather when location changes
+  // Save location when it changes
   useEffect(() => {
     if (weatherLocationId) {
-      refreshWeather(weatherLocationId)
-    } else if (currentLocation) {
-      refreshWeather('current-location')
-    } else if (homeLocation) {
-      refreshWeather(homeLocation.id)
-    } else {
-      refreshWeather()
+      api.storage.set(LAST_LOCATION_KEY, weatherLocationId)
     }
-  }, [weatherLocationId, currentLocation, homeLocation?.id])
+  }, [weatherLocationId])
+
+  // Stale-while-revalidate: Show cached data immediately, refresh in background
+  useEffect(() => {
+    const locationId = weatherLocationId ||
+      (currentLocation ? 'current-location' : homeLocation?.id) ||
+      'default'
+
+    // Check cache first for instant display
+    const cached = getCachedWeather(locationId)
+
+    if (cached) {
+      // Show cached data immediately
+      setCachedWeatherDisplay(cached.data)
+
+      // Revalidate if cache is stale
+      if (isCacheStale(locationId)) {
+        debouncedRefresh(locationId)
+      }
+    } else {
+      // No cache - clear display and fetch fresh data
+      setCachedWeatherDisplay(null)
+      setIsRevalidating(true)
+
+      // Direct refresh for initial load (no debounce)
+      if (canRefresh(locationId)) {
+        recordRefresh(locationId)
+        refreshWeather(locationId === 'default' ? undefined : locationId)
+      }
+    }
+  }, [weatherLocationId, currentLocation, homeLocation?.id, debouncedRefresh, refreshWeather])
+
+  // Update cache when fresh weather data arrives from host app
+  useEffect(() => {
+    if (weather) {
+      const locationId = weatherLocationId ||
+        (currentLocation ? 'current-location' : homeLocation?.id) ||
+        'default'
+
+      // Store in cache
+      setCachedWeather(locationId, weather)
+      // Update display
+      setCachedWeatherDisplay(weather)
+      setIsRevalidating(false)
+    }
+  }, [weather, weatherLocationId, currentLocation, homeLocation?.id])
+
+  // Determine which weather data to display (cached or fresh)
+  const displayWeather = cachedWeatherDisplay || weather
 
   // Icons
   const { Home, Navigation, Cloud, CloudRain, Sun, CloudSun } = lucideIcons
 
-  // Get weather icon
+  // Memoized icon resolver to avoid recreating on every render
+  const iconComponents = useMemo(() => ({
+    Sun,
+    CloudSun,
+    Cloud,
+    CloudRain,
+  }), [Sun, CloudSun, Cloud, CloudRain])
+
+  // Get weather icon using static lookup map
   const getWeatherIcon = (icon: string) => {
-    if (icon?.includes('01')) return Sun
-    if (icon?.includes('02')) return CloudSun
-    if (icon?.includes('03') || icon?.includes('04')) return Cloud
-    if (icon?.includes('09') || icon?.includes('10')) return CloudRain
-    return Cloud
+    const key = getWeatherIconKey(icon)
+    return iconComponents[key as keyof typeof iconComponents] || Cloud
   }
 
   // Format hour
@@ -150,18 +343,18 @@ function WeatherPage() {
     return date.toLocaleDateString('en-US', { weekday: 'short' })
   }
 
-  // Hourly data
+  // Hourly data - uses displayWeather for stale-while-revalidate
   const hourlyData = useMemo(() => {
-    if (!weather?.hourlyForecast) return []
+    if (!displayWeather?.hourlyForecast) return []
     const now = Date.now() / 1000
-    return weather.hourlyForecast.filter((hour: any) => hour.dt >= now).slice(0, 24)
-  }, [weather])
+    return displayWeather.hourlyForecast.filter((hour: any) => hour.dt >= now).slice(0, 24)
+  }, [displayWeather])
 
-  // Daily data
+  // Daily data - uses displayWeather for stale-while-revalidate
   const dailyData = useMemo(() => {
-    if (!weather?.dailyForecast) return []
-    return weather.dailyForecast.slice(0, 8)
-  }, [weather])
+    if (!displayWeather?.dailyForecast) return []
+    return displayWeather.dailyForecast.slice(0, 8)
+  }, [displayWeather])
 
   // Get selected location
   const isCurrentLocationSelected = weatherLocationId === 'current-location'
@@ -170,7 +363,7 @@ function WeatherPage() {
     ? (currentLocation ? { name: currentLocation.name, isHome: false } : null)
     : (selectedSavedLocation || homeLocation)
 
-  if (weatherError && !weather) {
+  if (weatherError && !displayWeather) {
     return (
       <div className="flex-1 min-h-screen bg-background p-8">
         <div className="mx-auto">
@@ -186,7 +379,7 @@ function WeatherPage() {
     <div className="flex-1 min-h-screen bg-background p-8">
       <div className="mx-auto space-y-8">
         {/* Header with location info */}
-        {weather && selectedLocation && (
+        {displayWeather && selectedLocation && (
           <div className="text-center mb-8">
             <div className="flex items-center justify-center gap-2 mb-2">
               {isCurrentLocationSelected ? (
@@ -197,13 +390,16 @@ function WeatherPage() {
               <h2 className="text-3xl font-semibold">
                 {isCurrentLocationSelected ? 'Current location' : selectedLocation.name}
               </h2>
+              {isRevalidating && (
+                <span className="text-xs text-muted-foreground animate-pulse">Updating...</span>
+              )}
             </div>
-            <div className="text-6xl font-light mb-2">{weather.temperature}°</div>
+            <div className="text-6xl font-light mb-2">{displayWeather.temperature}°</div>
             <div className="text-xl text-muted-foreground capitalize mb-2">
-              {weather.description}
+              {displayWeather.description}
             </div>
             <div className="text-lg text-muted-foreground">
-              H:{weather.tempMax}° L:{weather.tempMin}°
+              H:{displayWeather.tempMax}° L:{displayWeather.tempMin}°
             </div>
           </div>
         )}
@@ -299,34 +495,34 @@ function WeatherPage() {
           {/* Weather Widgets - Right Side Grid */}
           <div className="lg:col-span-9 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {/* Wind Widget */}
-            {weather && (
+            {displayWeather && (
               <Card>
                 <CardHeader>
                   <h3 className="text-sm font-medium text-muted-foreground">WIND</h3>
                 </CardHeader>
                 <CardContent>
                   <div className="space-y-2">
-                    <div className="text-2xl font-semibold">{weather.windSpeed} mph</div>
-                    {weather.windGust && (
-                      <div className="text-sm text-muted-foreground">Gusts: {weather.windGust} mph</div>
+                    <div className="text-2xl font-semibold">{displayWeather.windSpeed} mph</div>
+                    {displayWeather.windGust && (
+                      <div className="text-sm text-muted-foreground">Gusts: {displayWeather.windGust} mph</div>
                     )}
-                    <div className="text-sm text-muted-foreground">{weather.windDirection}</div>
+                    <div className="text-sm text-muted-foreground">{displayWeather.windDirection}</div>
                   </div>
                 </CardContent>
               </Card>
             )}
 
             {/* Humidity Widget */}
-            {weather && (
+            {displayWeather && (
               <Card>
                 <CardHeader>
                   <h3 className="text-sm font-medium text-muted-foreground">HUMIDITY</h3>
                 </CardHeader>
                 <CardContent>
                   <div className="space-y-2">
-                    <div className="text-3xl font-semibold">{weather.humidity}%</div>
+                    <div className="text-3xl font-semibold">{displayWeather.humidity}%</div>
                     <div className="text-sm text-muted-foreground">
-                      The dew point is {weather.dewPoint}° right now.
+                      The dew point is {displayWeather.dewPoint}° right now.
                     </div>
                   </div>
                 </CardContent>
@@ -334,16 +530,16 @@ function WeatherPage() {
             )}
 
             {/* Visibility Widget */}
-            {weather && (
+            {displayWeather && (
               <Card>
                 <CardHeader>
                   <h3 className="text-sm font-medium text-muted-foreground">VISIBILITY</h3>
                 </CardHeader>
                 <CardContent>
                   <div className="space-y-2">
-                    <div className="text-3xl font-semibold">{weather.visibility}</div>
+                    <div className="text-3xl font-semibold">{displayWeather.visibility}</div>
                     <div className="text-sm text-muted-foreground">
-                      {weather.visibility?.includes('10+') ? 'Perfectly clear view' : 'Good visibility'}
+                      {displayWeather.visibility?.includes('10+') ? 'Perfectly clear view' : 'Good visibility'}
                     </div>
                   </div>
                 </CardContent>
@@ -351,7 +547,7 @@ function WeatherPage() {
             )}
 
             {/* Pressure Widget */}
-            {weather && (
+            {displayWeather && (
               <Card>
                 <CardHeader>
                   <h3 className="text-sm font-medium text-muted-foreground">PRESSURE</h3>
@@ -359,7 +555,7 @@ function WeatherPage() {
                 <CardContent>
                   <div className="space-y-2">
                     <div className="text-2xl font-semibold">
-                      {(weather.pressure * 0.02953).toFixed(2)} inHg
+                      {(displayWeather.pressure * 0.02953).toFixed(2)} inHg
                     </div>
                   </div>
                 </CardContent>
@@ -367,7 +563,7 @@ function WeatherPage() {
             )}
 
             {/* UV Index Widget */}
-            {weather && (
+            {displayWeather && (
               <Card>
                 <CardHeader>
                   <h3 className="text-sm font-medium text-muted-foreground">UV INDEX</h3>
@@ -375,9 +571,9 @@ function WeatherPage() {
                 <CardContent>
                   <div className="space-y-2">
                     <div className="flex items-baseline gap-2">
-                      <span className="text-3xl font-semibold">{Math.round(weather.uvi)}</span>
+                      <span className="text-3xl font-semibold">{Math.round(displayWeather.uvi)}</span>
                       <span className="text-sm text-muted-foreground">
-                        {weather.uvi <= 2 ? 'Low' : weather.uvi <= 5 ? 'Moderate' : weather.uvi <= 7 ? 'High' : 'Very High'}
+                        {displayWeather.uvi <= 2 ? 'Low' : displayWeather.uvi <= 5 ? 'Moderate' : displayWeather.uvi <= 7 ? 'High' : 'Very High'}
                       </span>
                     </div>
                   </div>
@@ -386,16 +582,16 @@ function WeatherPage() {
             )}
 
             {/* Sunrise/Sunset Widget */}
-            {weather && (
+            {displayWeather && (
               <Card>
                 <CardHeader>
                   <h3 className="text-sm font-medium text-muted-foreground">SUNRISE</h3>
                 </CardHeader>
                 <CardContent>
                   <div className="space-y-2">
-                    <div className="text-2xl font-semibold">{weather.sunrise}</div>
+                    <div className="text-2xl font-semibold">{displayWeather.sunrise}</div>
                     <div className="text-sm text-muted-foreground">
-                      Sunset: {weather.sunset}
+                      Sunset: {displayWeather.sunset}
                     </div>
                   </div>
                 </CardContent>
@@ -419,12 +615,14 @@ function WeatherSettings() {
   const [temperatureUnit, setTemperatureUnit] = useState<'fahrenheit' | 'celsius'>('fahrenheit')
   const [loading, setLoading] = useState(true)
 
-  // Load settings on mount
+  // Load settings on mount - parallelize for faster load
   useEffect(() => {
     async function loadSettings() {
-      const interval = await api.storage.get<number>('refreshInterval')
-      const unit = await api.storage.get<'fahrenheit' | 'celsius'>('temperatureUnit')
-      
+      const [interval, unit] = await Promise.all([
+        api.storage.get<number>('refreshInterval'),
+        api.storage.get<'fahrenheit' | 'celsius'>('temperatureUnit'),
+      ])
+
       if (interval) setRefreshInterval(interval)
       if (unit) setTemperatureUnit(unit)
       setLoading(false)
